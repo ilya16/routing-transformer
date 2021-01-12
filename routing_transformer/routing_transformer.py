@@ -319,7 +319,7 @@ class KmeansAttention(nn.Module):
         self.mem_key = nn.Parameter(torch.randn(num_heads, num_clusters, self.num_mem_kv, head_dim))
         self.mem_value = nn.Parameter(torch.randn(num_heads, num_clusters, self.num_mem_kv, head_dim))
 
-    def forward(self, q, k, v, query_mask = None, key_mask = None, **kwargs):
+    def forward(self, q, k, v, query_mask = None, key_mask = None, seq2seq_mask_len = None, **kwargs):
         b, h, t, d, kv_t, wsz, c_wsz, nc, device, dtype = *q.shape, k.shape[2], self.window_size, self.context_window_size, self.num_clusters, q.device, q.dtype
         is_reverse = kwargs.pop('_reverse', False)
 
@@ -373,6 +373,10 @@ class KmeansAttention(nn.Module):
         if self.causal:
             q_mask, kv_mask = map(lambda t: t.reshape(b, h, nc, -1), (indices, kv_indices))
             mask = q_mask[:, :, :, :, None] >= kv_mask[:, :, :, None, :]
+
+            if seq2seq_mask_len is not None:
+                mask = mask | (kv_mask <= seq2seq_mask_len[:, None, None, None])[:, :, :, None, :]
+
             mask = F.pad(mask, (self.num_mem_kv, 0), value=True)
             dots.masked_fill_(~mask, mask_value)
             del mask            
@@ -478,7 +482,7 @@ class SelfAttention(nn.Module):
         self.to_out = nn.Linear(dim_heads, dim, bias = False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, context = None, input_mask = None, context_mask = None, **kwargs):
+    def forward(self, x, context = None, input_mask = None, context_mask = None, seq2seq_mask_len = None, **kwargs):
         assert not (self.receives_context and context is None), 'context must be passed if self attention is set to receive context'
         b, t, e, h, dh = *x.shape, self.heads, self.dim_head
         has_local, has_global = map(lambda x: x > 0, (self.local_attn_heads, self.global_attn_heads))
@@ -505,11 +509,11 @@ class SelfAttention(nn.Module):
         total_loss = torch.tensor(0., requires_grad=True, **to(x))
 
         if has_local:
-            local_out = self.local_attn(lq, lk, lv, input_mask = input_mask)
+            local_out = self.local_attn(lq, lk, lv, input_mask = input_mask, seq2seq_mask_len = seq2seq_mask_len)
             out.append(local_out)
 
         if has_global:
-            global_out, loss = self.global_attn(q, k, v, query_mask = input_mask, key_mask = context_mask)
+            global_out, loss = self.global_attn(q, k, v, query_mask = input_mask, key_mask = context_mask, seq2seq_mask_len = seq2seq_mask_len)
             total_loss = total_loss + loss
 
             out.append(global_out)
@@ -575,7 +579,7 @@ class RoutingTransformer(nn.Module):
         route_context = ((False, False), *attn_context_layer) * depth
 
         context_route_map = {'context': route_context, 'context_mask': route_context} if receives_context else {}
-        attn_route_map = {'input_mask': route_attn}
+        attn_route_map = {'input_mask': route_attn, 'seq2seq_mask_len': route_attn}
         self.layers = execute_type(layers, args_route = {**attn_route_map, **context_route_map}, layer_dropout = layer_dropout)
 
         if _register_kmeans_update:
